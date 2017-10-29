@@ -1,0 +1,295 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="dpbuddy.end-to-end" xmlns:dp="antlib:com.myarch.dpbuddy" >
+ 
+    <description>
+        End-to-end example demonstrating a build/deploy process for DataPower artifacts using DPBuddy.
+        "clean.deploy.services" builds the test domain from the components residing under version control.
+        "clean.deploy.domain" promotes the entire domain to a higher environment.
+    </description>
+ 
+    <property environment="envvars"/>
+    <!-- Specify where dpbuddy is installed, we can use an environment variable or a property -->
+    <property name="dpbuddy.home" location="${envvars.DPBUDDY_HOME}" />
+ 
+    <dirname property="script.dir" file="${ant.file}" />
+ 
+    <taskdef uri="antlib:com.myarch.dpbuddy">
+        <classpath>
+            <!-- We need to exclude Ant jars packages with DPBuddy -->
+            <fileset dir="${dpbuddy.home}/lib" excludes="ant-*"/>
+        </classpath>
+    </taskdef>
+ 
+    <!-- Location of the properties file containing DataPower URLs and other configuration -->
+    <property name="dp.config.home" location="${basedir}"/>
+ 
+    <loadproperties srcFile="${dp.config.home}/dp.properties" />
+ 
+    <!-- This task to make environment-specific properties available to non-DPBuddy tasks.
+    In this sample it is used by running SoapUI target (at the bottom of the file).
+    This also allows to "echo" environment variables.
+    E.g., if you want to see a value of the current domain, you can use <echo>${dp.domain}</echo>
+     -->
+    <dp:environment prefix="${dp.env}" />
+ 
+ 
+    <!-- Location of DataPower configuration files -->
+    <property name="services.config.home" location="dpconfigs"/>
+    <!-- Location of xsd/wsdl/xsl artifacts used by DataPower objects and services -->
+    <property name="services.files.home" location="services"/>
+ 
+    <!-- Set release info for the audit file. If running from Jenkins, you can use one of the Jenkins variables, such as BUILD_NUMBER -->
+    <property name="dp.release.info" value="release-3.2"/>
+ 
+    <tstamp/>
+ 
+    <!-- ** Targets used in the course of developing DataPower services and objects -->
+ 
+    <!-- Reusable transformation rules to exclude default objects from export
+    since we did not change them. This rule is used by the "export" task.
+     -->
+    <dp:transform id="transform.remove.default">
+        <dpExclude class="(HTTPUserAgent|XMLManager)" name="default"/>
+    </dp:transform>
+ 
+    <!-- Export all proxies and firewalls after the development is done and check them in -->
+    <target name="export.services" description="Export services and related objects from a dev domain" >
+        <!-- Note that the configuration will be automatically cleaned (files elements are removed) and
+        formatted with proper indentation so it could be version-controlled.-->
+        <dp:export file="${services.config.home}/XMLFirewall.xml" classPattern=".*Firewall.*">
+            <transform refid="transform.remove.default"/>
+        </dp:export>
+        <dp:export file="${services.config.home}/WSProxy.xml" classPattern="WSGatew.*">
+            <transform refid="transform.remove.default"/>
+        </dp:export>
+    </target>
+ 
+    <target name="export.crypto" description="Export all crypto objects">
+        <dp:export file="${services.config.home}/Crypto.xml" classPattern="Crypto.*"/>
+    </target>
+ 
+    <target name="export.domain.definition" description="Export the baseline definition of a domain">
+        <!-- This definition will be used for creating/re-creating empty domains-->
+        <!-- We will export the definition of the current domain (defined by the dp.domain property) -->
+        <dp:export file="${services.config.home}/DomainDefinition.xml" domain="default"
+                classPattern="Domain" namePattern="${dp.domain}">
+            <transform>
+                <!-- Replace all mentioning of the domain name with the ${dp.domain} variable.
+                $$ will escape the dollar sign so Ant will not treat it as a variable during export -->
+                <replaceText textToReplace="${dp.domain}" replaceWith="$${dp.domain}"/>
+            </transform>
+        </dp:export>
+    </target>
+ 
+    <!-- ** Targets used to deploy to a test environment -->
+ 
+    <!-- Prepare clean domain -->
+    <target name="create.clean.domain" description="Delete domain if exists and create an empty one">
+        <!-- We need to unquiesce the domain right before we're deleting it, otherwise
+        the newly created domain will be in an inconsistent state (UP but quiesced) so it won't be possible
+        to quiesce it (DataPower issue) -->
+        <dp:unquiesceDomain />
+        <!-- Delete the domain. We have to do it from the default domain -->
+        <dp:delConfig quiet="true" domain="default" classPattern="Domain" namePattern="${dp.domain}" />
+        <!-- Resolve Ant vars in the XML file, import our empty domain definition into the default domain, save if successful -->
+        <dp:buddyImport file="${services.config.home}/DomainDefinition.xml" domain="default" save="true" resolveVars="true" />
+        <!-- Note that the checkpoint is created in the target domain, not in the default -->
+        <dp:checkpoint name="clean-domain"/>
+    </target>
+ 
+    <!-- Upload/configure certs and crypto -->
+    <target name="upload.certs" description="Upload certificates and keys" >
+        <dp:copy toDir="cert:/" dir="${script.dir}/certs" includes="*-cert *-key" />
+    </target>
+ 
+    <target name="import.crypto.config" description="Import crypto configuration">
+        <dp:buddyImport file="${services.config.home}/Crypto.xml" />
+        <!-- Verify that crypto objects are up, they could be down if there is an issue with certs/keys-->
+        <dp:assertState classPattern="Crypto.*" />
+    </target>
+ 
+    <!-- upload services-related files and services configuration; flush document and stylesheet cache -->
+    <target name="upload.files"
+            description="Upload WSDL, XSLT and other files to the local:/ filesystem of the appliance">
+        <dp:copy cleanDirectories="true" flatten="true" flushCache="true" >
+            <!-- Destination directory can be specified at the fileset level -->
+            <dpFileset dir="${services.files.home}" toDir="/xslt" includes="**/*.xslt"/>
+            <dpFileset dir="${services.files.home}" toDir="/services/wsdl" includes="**/*.wsdl **/*.xsd"/>
+        </dp:copy>
+    </target>
+ 
+    <!-- Reusable transformation rules - we use them from "import.service.config" and from "import.domain".
+    You may want to put all reusable transformations into a separate file -->
+ 
+ 
+    <dp:transform id="transform.wsproxy">
+        <setText xpath="//*[@name='TestHTTPHandler']//LocalPort" value="${dp.wsproxy.port}"/>
+        <setText xpath="//*[@name='testServiceProxy']//RemoteEndpointHostname" value="${dp.wsproxy.remote.host}" />
+        <!-- Specify the version of the service - it will be displayed in the "comments" field in WebGUI -->
+        <!-- delete the existing comments field if exists -->
+        <delete xpath="//XMLFirewallService/UserSummary" matchRequired="false"/>
+        <!-- add the comment with the version number -->
+        <add xpath="//WSGateway" >
+            <UserSummary>Version ${dp.release.info}</UserSummary>
+        </add>
+    </dp:transform>
+ 
+    <dp:transform id="transform.firewall">
+        <setText xpath="//*[@name='testFirewall']//LocalPort" value="${dp.xmlfirewall.port}" />
+        <delete xpath="//XMLFirewallService/UserSummary" matchRequired="false"/>
+        <add xpath="//XMLFirewallService" >
+            <UserSummary>Version ${dp.release.info}</UserSummary>
+        </add>
+    </dp:transform>
+ 
+    <target name="import.services.config"
+            description="Import all configuration objects and services into the test domain" >
+ 
+        <dp:buddyImport file="${services.config.home}/WSProxy.xml" >
+            <transform refid="transform.wsproxy"/>
+        </dp:buddyImport>
+ 
+        <dp:buddyImport file="${services.config.home}/XMLFirewall.xml" >
+            <transform refid="transform.firewall"/>
+        </dp:buddyImport>
+        <!-- Show last 15 lines of the DataPower log just in case -->
+        <dp:tailLog lines="15"/>
+ 
+    </target>
+ 
+    <!-- Alternatively, you can copy configuration directly from the source domain to the target domain.
+    This is less reliable than deploying services from version control -->
+    <target name="copy.services.config"
+            description="Copy services configuration directly from Dev domain to our target environment" >
+ 
+        <property name="dev.config.file" location="builds/dev-services.zip"/>
+ 
+        <dp:export env="devtest.dev" file="${dev.config.file}">
+            <exportObject class=".*Firewall.*"/>
+            <exportObject class="WSGatew.*" />
+        </dp:export>
+ 
+        <!-- Perform the import in the the target domain and save the domain configuration -->
+        <dp:buddyImport env="${dp.env}" file="${dev.config.file}" save="true">
+            <transform>
+                <transform refid="transform.wsproxy"/>
+                <transform refid="transform.firewall"/>
+            </transform>
+        </dp:buddyImport>
+ 
+    </target>
+ 
+    <target name="verify.import" description="Verify that all objects and services are up and running">
+        <!-- Verify that all objects in the domain are up -->
+        <dp:assertState/>
+        <!-- Make sure the services are up -->
+        <dp:assertActiveService>
+            <object class="(WSGateway|XMLFi.*)" />
+        </dp:assertActiveService>
+ 
+        <!-- Make sure the right ports are open -->
+        <dp:assertOpenPorts ports="${dp.wsproxy.port}, ${dp.xmlfirewall.port}" />
+ 
+    </target>
+ 
+    <target name="checkpoint" description="Create the checkpoint and export the final domain configuration">
+        <!-- Create checkpoint with the release version. dots will be replaced with underscores; dots are not allowed in names-->
+        <dp:checkpoint name="${dp.release.info}"/>
+        <!-- We could also export the domain configuration in XML format so we have the history of all changes
+        The exported file should be version-controled or, at the very least, archived by your build server -->
+        <dp:export file="builds/${dp.domain}.xcfg" />
+    </target>
+ 
+    <target name="rollback" description="Rollback to the last checkpoint">
+        <!-- We're not providing the checkpoint name, so we will automatically rollback to the
+        latest checkpoint -->
+        <dp:rollback/>
+    </target>
+ 
+    <target name="deploy.services" depends="upload.files, import.services.config, verify.import, checkpoint"
+        description="Upload files and import configuration"/>
+ 
+    <target name="deploy.services.copy" depends="upload.files, copy.services.config, verify.import, checkpoint"
+        description="Upload files and copy configuration from dev to the target domain (not recommended)"/>
+ 
+    <property name="domain.file" location="builds/app-domain.zip" />
+    <target name="export.domain" description="Export the entire domain">
+        <dp:export file="${domain.file}" allFiles="true" />
+    </target>
+ 
+    <!-- End-to-end build of a domain from scratch -->
+    <target name="clean.deploy.services" depends="create.clean.domain, upload.certs, import.crypto.config, deploy.services, run.tests, export.domain"
+        description="Re-create the test domain, upload all certs and files and import the configuration"/>
+ 
+    <!-- You can run automated test targets after deployment -->
+ 
+    <!-- ** Targets used to deploy to "higher" environments, such as QA, pre-production, production -->
+    <!-- We will deploy the entire domain exported from the test environment -->
+ 
+    <!-- Quiesce all services in the domain before making any changes -->
+    <target name="quiesce.domain" description="Quiesce the domain">
+        <dp:quiesceDomain/>
+    </target>
+ 
+    <!-- Delete all objects and service and all files from the local filesystem -->
+    <target name="clean.domain" description="Clean the domain">
+        <dp:resetDomain/>
+        <!-- Exclude the disk array mount point since it cannot be deleted -->
+        <dp:delete include="local:/(?!ondisk$).*" matchRequired="false" dryRun="false" />
+    </target>
+ 
+    <!-- Import all services, objects and files that were exported by "export.domain" -->
+    <target name="import.domain" description="Import domain">
+ 
+        <dp:import file="${domain.file}" save="true"
+                domainComments="Version: ${dp.release.info}. Deployed: ${DSTAMP} ${TSTAMP}" rollbackOnError="true">
+ 
+            <transform>
+                <transform refid="transform.wsproxy"/>
+                <transform refid="transform.firewall"/>
+            </transform>
+ 
+        </dp:import>
+ 
+        <!-- Log the message to the DataPower log for audit purposes -->
+        <dp:log message="Imported domain ${domain.file}" />
+ 
+        <!-- Unquiesce domain in case if it was quiesced before.
+        It is safe to run this task even if the domain was not quiesced -->
+        <dp:unquiesceDomain/>
+ 
+    </target>
+ 
+    <!-- Note that we're uploading certs/keys as part of the deployment, which might be unnecessary if you're
+    not deleting the domain -->
+    <target name="deploy.domain" depends="quiesce.domain, upload.certs, import.domain, verify.import, checkpoint"
+        description="Quiesce the domain and import services" />
+ 
+    <target name="clean.deploy.domain"
+            description="Quiesce the domain, clean it and import services">
+        <!-- Execute this target for each device/environment prefix defined in "dp.env"
+        This will also execute all the dependent targets of _clean.deploy.domain
+        -->
+        <dp:execTarget target="_clean.deploy.domain" />
+    </target>
+ 
+    <!-- Internal target, invoked by "clean.deploy.domain" -->
+    <target name="_clean.deploy.domain" depends="quiesce.domain, clean.domain, deploy.domain, run.tests"/>
+ 
+    <!-- This will be run automatically when we deploy the domain -->
+    <target name="run.tests" description="Run soapUI tests for our services">
+ 
+        <!-- This assumes that soapUI/bin was added to PATH -->
+        <condition property="soapui.exe" value="testrunner.bat" else="testrunner.sh">
+            <os family="windows"/>
+        </condition>
+ 
+        <exec executable="${soapui.exe}"  dir="${basedir}" searchpath="true" failonerror="true" >
+            <!-- You can also specify the test suite using -sFirewallTest -->
+            <!-- Override host and ports to point to the hosts and pors for this environment -->
+            <!-- Note that reports are saved in a folder with the environment name, in case if we run this task in a loop against multiple devices -->
+            <arg line="-Phost=${dp.url} -Pwsproxy.port=${dp.wsproxy.port} -Pfirewall.port=${dp.xmlfirewall.port} -f testReports/${dp.env} -r -j ${script.dir}/soapui/DPTests.xml" />
+        </exec>
+    </target>
+ 
+</project>
